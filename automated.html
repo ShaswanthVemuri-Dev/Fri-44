@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Automated Mode</title>
+  <style>
+    /* Prevent horizontal overflow */
+    html, body {
+      overflow-x: hidden;
+    }
+    /* Full viewport height and styling */
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: black;
+      color: #ccff00;
+      font-family: sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    #topSection {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+    }
+    #bottomSection {
+      display: flex;
+      justify-content: center;
+      align-items: flex-end;
+      margin-bottom: 2em;
+    }
+    button {
+      font-weight: bold;
+      text-transform: uppercase;
+      border-radius: 1.25em;
+      cursor: pointer;
+      transition: background-color 0.3s, color 0.3s;
+      border: 0.125em solid #ccff00;
+    }
+    #controlButton {
+      background-color: #ccff00;
+      color: black;
+      width: clamp(15em, 50vw, 45em);
+      font-size: clamp(2em, 8vw, 5em);
+      padding: 1em;
+      margin: 0.5rem;
+    }
+    #controlButton:hover {
+      background-color: #ccff00;
+      color: black;
+    }
+    #backButton {
+      background-color: black;
+      color: #ccff00;
+      width: clamp(14em, 40vw, 35em);
+      font-size: clamp(1.8em, 7vw, 4em);
+      padding: 0.8em;
+      margin: 0.5rem;
+    }
+    #backButton:hover {
+      background-color: #ccff00;
+      color: black;
+    }
+    /* Hide the hidden video and canvas */
+    #video, #canvas {
+      display: none;
+    }
+    /* Visible preview canvas for captured image */
+    #capturePreview {
+      width: 200px;
+      height: auto;
+      margin-bottom: 1em;
+      border: 0.125em solid #ccff00;
+    }
+    /* Generated text styling: big font */
+    #resultText {
+      font-size: 2em;
+      text-align: center;
+      margin-top: 1em;
+      max-width: 90%;
+    }
+  </style>
+</head>
+<body>
+  <!-- Top section: preview canvas, START button, and generated text output -->
+  <div id="topSection">
+    <canvas id="capturePreview"></canvas>
+    <button id="controlButton">START</button>
+    <p id="resultText"></p>
+  </div>
+
+  <!-- Bottom section: GO BACK button -->
+  <div id="bottomSection">
+    <button id="backButton">GO BACK</button>
+  </div>
+
+  <video id="video" autoplay playsinline></video>
+  <canvas id="canvas"></canvas>
+  
+  <script>
+    const controlButton = document.getElementById('controlButton');
+    const backButton = document.getElementById('backButton');
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const capturePreview = document.getElementById('capturePreview');
+    const resultTextElement = document.getElementById('resultText');
+
+    let videoStream = null;
+    let isRunning = false;
+    let currentAbortController = null; // For aborting pending fetch
+    let currentSource = null; // Current AudioBufferSourceNode
+
+    // Create an AudioContext and ensure it's resumed on a user gesture.
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    async function resumeAudioContext() {
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
+    }
+
+    // playTTS: Uses the /api/tts endpoint to get the MP3 URL,
+    // fetches the audio as an ArrayBuffer, decodes it,
+    // plays it via an AudioBufferSourceNode, and when audio ends, triggers captureAndProcess().
+    async function playTTS(text) {
+      try {
+        await resumeAudioContext(); // Ensure audio context is unlocked
+        const response = await fetch('/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        const data = await response.json();
+        if (data.error) {
+          console.error("TTS error:", data.error);
+          return;
+        }
+        // Fetch audio file as ArrayBuffer.
+        const audioResponse = await fetch(data.url);
+        const arrayBuffer = await audioResponse.arrayBuffer();
+        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        source.onended = () => {
+          if (isRunning) {
+            captureAndProcess();
+          }
+        };
+        currentSource = source;
+        source.start(0);
+      } catch (error) {
+        console.error("Error in playTTS:", error);
+      }
+    }
+    
+    // captureAndProcess: Captures an image from the video stream,
+    // updates the preview canvas, sends the image to /api/automated,
+    // displays the generated text, and triggers playTTS.
+    async function captureAndProcess() {
+      try {
+        currentAbortController = new AbortController();
+        const signal = currentAbortController.signal;
+        
+        // Use "ideal" to prefer the back camera if available, but fallback if not.
+        if (!videoStream) {
+          videoStream = await navigator.mediaDevices.getUserMedia({ 
+            video: { facingMode: { ideal: "environment" } }
+          });
+          video.srcObject = videoStream;
+          await video.play();
+        }
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        
+        // Update the visible preview canvas.
+        capturePreview.width = 200;
+        capturePreview.height = (video.videoHeight / video.videoWidth) * 200;
+        const previewCtx = capturePreview.getContext('2d');
+        previewCtx.drawImage(canvas, 0, 0, capturePreview.width, capturePreview.height);
+        
+        const imageData = canvas.toDataURL('image/jpeg');
+        const base64Image = imageData.split(',')[1];
+        
+        resultTextElement.textContent = "Generating description...";
+        
+        const response = await fetch('/api/automated', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal,
+          body: JSON.stringify({ image_base64: base64Image })
+        });
+        if (!response.ok) throw new Error("API error");
+
+        let resultText = "";
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        while (true) {
+          if (!isRunning) return;
+          const { value, done } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          chunk.split("\n").forEach(line => {
+            if (line.startsWith("data: ")) {
+              const jsonStr = line.slice(6).trim();
+              if (jsonStr) {
+                resultText += JSON.parse(jsonStr).text;
+                resultTextElement.textContent = resultText;
+              }
+            }
+          });
+        }
+        if (isRunning && resultText) {
+          playTTS(resultText);
+        }
+      } catch (error) {
+        if (error.name === "AbortError") {
+          console.log("Fetch aborted");
+          return;
+        }
+        console.error(error);
+        if (isRunning) {
+          playTTS("I'm sorry, I couldn't process the environment.");
+        }
+      } finally {
+        currentAbortController = null;
+      }
+    }
+    
+    // Toggle the process when the START/STOP button is clicked.
+    controlButton.addEventListener('click', async () => {
+      await resumeAudioContext(); // Ensure the audio context is active on user gesture.
+      if (!isRunning) {
+        isRunning = true;
+        controlButton.textContent = "STOP";
+        captureAndProcess();
+      } else {
+        isRunning = false;
+        controlButton.textContent = "START";
+        if (currentAbortController) {
+          currentAbortController.abort();
+        }
+        if (videoStream) {
+          videoStream.getTracks().forEach(track => track.stop());
+          videoStream = null;
+        }
+        if (currentSource) {
+          currentSource.stop();
+          currentSource = null;
+        }
+      }
+    });
+    
+    // GO BACK button: Stop all processes and navigate home.
+    backButton.addEventListener('click', () => {
+      if (isRunning) {
+        isRunning = false;
+        controlButton.textContent = "START";
+        if (currentAbortController) {
+          currentAbortController.abort();
+        }
+        if (videoStream) {
+          videoStream.getTracks().forEach(track => track.stop());
+          videoStream = null;
+        }
+        if (currentSource) {
+          currentSource.stop();
+          currentSource = null;
+        }
+      }
+      window.location.href = "/";
+    });
+  </script>
+</body>
+</html>
