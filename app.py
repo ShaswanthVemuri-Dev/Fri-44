@@ -1,9 +1,9 @@
+import os
 import json
+import uuid
 import google.generativeai as genai
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from gtts import gTTS
-import os
-import uuid
 
 # Set your API key for generative endpoints if needed
 API_KEY = 'AIzaSyBdvIaaunoykSOSm7y2h0itakBG7WYyKpk'
@@ -11,8 +11,11 @@ genai.configure(api_key=API_KEY)
 
 app = Flask(__name__)
 
-# Directory for generated TTS audio files
-tts_output_dir = "static/tts_audio"
+# Get the absolute directory where this script is located.
+basedir = os.path.abspath(os.path.dirname(__file__))
+
+# Directory for generated TTS audio files (inside static/tts_audio)
+tts_output_dir = os.path.join(basedir, "static", "tts_audio")
 os.makedirs(tts_output_dir, exist_ok=True)
 
 def generate_stream(response):
@@ -22,7 +25,13 @@ def generate_stream(response):
 
 @app.route("/")
 def index():
-    return send_file('index.html')
+    # Serve the index.html from the root directory using an absolute path.
+    return send_file(os.path.join(basedir, 'index.html'))
+
+@app.route("/automated")
+def automated_page():
+    # Serve the automated.html from the root directory using an absolute path.
+    return send_file(os.path.join(basedir, 'automated.html'))
 
 @app.route("/api/generate", methods=["POST"])
 def generate_api():
@@ -95,17 +104,15 @@ def tts_api():
         filepath = os.path.join(tts_output_dir, filename)
         tts = gTTS(text, lang="en")
         tts.save(filepath)
-        return jsonify({"url": f"/{tts_output_dir}/{filename}"})
+        # Return the URL relative to the static folder.
+        return jsonify({"url": f"/static/tts_audio/{filename}"})
     except Exception as e:
         return jsonify({"error": str(e)})
 
-@app.route("/automated")
-def automated_page():
-    return send_file('automated.html')
-
 @app.route('/<path:path>')
 def serve_static(path):
-    return send_from_directory('.', path)
+    # Serve static files from the repository root.
+    return send_from_directory(basedir, path)
 
 if __name__ == "__main__":
     app.run(host='127.0.0.1', port=5000, debug=True)
