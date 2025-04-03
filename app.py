@@ -22,7 +22,7 @@ def generate_stream(response):
 
 @app.route("/")
 def index():
-    return send_file('web/index.html')
+    return send_file('index.html')
 
 @app.route("/api/generate", methods=["POST"])
 def generate_api():
@@ -101,11 +101,12 @@ def tts_api():
 
 @app.route("/automated")
 def automated_page():
-    return send_file('web/automated.html')
+    return send_file('automated.html')
 
 @app.route('/<path:path>')
 def serve_static(path):
-    return send_from_directory('web', path)
+    return send_from_directory('.', path)
 
 if __name__ == "__main__":
     app.run(host='127.0.0.1', port=5000, debug=True)
+
