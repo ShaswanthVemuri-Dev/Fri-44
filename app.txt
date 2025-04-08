@@ -1,0 +1,235 @@
+import json
+import google.generativeai as genai
+from flask import Flask, jsonify, request, send_file, send_from_directory
+from gtts import gTTS
+import os
+import uuid
+import time
+import threading
+import subprocess
+import base64
+import RPi.GPIO as GPIO
+
+# Set your API key for generative endpoints if needed
+API_KEY = 'AIzaSyBdvIaaunoykSOSm7y2h0itakBG7WYyKpk'
+genai.configure(api_key=API_KEY)
+
+# ----------------- Battery Timer Configuration -----------------
+BATTERY_FULL_SECONDS = 3 * 3600  # 3 hours = 10800 seconds
+STATE_FILE = 'battery_state.json'
+CHARGING_PIN = 18                # GPIO pin used to detect charging
+DEBOUNCE_DURATION = 5            # Seconds the charging signal must be stable
+
+# Setup GPIO for charging detection
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(CHARGING_PIN, GPIO.IN)
+
+# Global variable to track remaining battery time (in seconds)
+remaining_seconds = BATTERY_FULL_SECONDS
+state_lock = threading.Lock()
+
+def load_state():
+    global remaining_seconds
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                data = json.load(f)
+                remaining_seconds = data.get('remaining_seconds', BATTERY_FULL_SECONDS)
+        except Exception:
+            remaining_seconds = BATTERY_FULL_SECONDS
+    else:
+        remaining_seconds = BATTERY_FULL_SECONDS
+
+def save_state():
+    with state_lock:
+        with open(STATE_FILE, 'w') as f:
+            json.dump({'remaining_seconds': remaining_seconds}, f)
+
+def is_charging_debounced():
+    """
+    Returns True if the charging signal remains active for DEBOUNCE_DURATION seconds.
+    """
+    start = time.monotonic()
+    while time.monotonic() - start < DEBOUNCE_DURATION:
+        if not GPIO.input(CHARGING_PIN):
+            return False
+        time.sleep(0.1)
+    return True
+
+def timer_thread():
+    """
+    Background thread that updates the remaining battery time.
+    If charging is detected, resets the timer to full.
+    """
+    global remaining_seconds
+    load_state()
+    last_time = time.monotonic()
+    while True:
+        now = time.monotonic()
+        elapsed = now - last_time
+        last_time = now
+        # Reset timer if charging is confirmed
+        if GPIO.input(CHARGING_PIN) and is_charging_debounced():
+            with state_lock:
+                remaining_seconds = BATTERY_FULL_SECONDS
+        else:
+            with state_lock:
+                remaining_seconds = max(remaining_seconds - elapsed, 0)
+        save_state()
+        time.sleep(0.5)
+
+# ----------------- End of Battery Timer Configuration -----------------
+
+# Directory for generated TTS audio files
+tts_output_dir = "static/tts_audio"
+os.makedirs(tts_output_dir, exist_ok=True)
+
+app = Flask(__name__)
+
+def generate_stream(response):
+    """Helper function that yields streaming response data."""
+    for chunk in response:
+        yield f'data: {json.dumps({"text": chunk.text})}\n\n'
+
+@app.route("/")
+def index():
+    return send_file('web/index.html')
+
+@app.route("/api/generate", methods=["POST"])
+def generate_api():
+    """
+    Prompting endpoint:
+    Always combines a default prompt with the user-provided text.
+    """
+    try:
+        data = request.get_json()
+        contents = data["contents"]
+
+        # Default prompt to be prepended
+        default_prompt = (
+            "Describe the image in a natural, simple, descriptive sentence, "
+            "using no more than 35 words. Start your description naturally. "
+        )
+        # Combine default prompt with user text
+        user_text = contents[0]["parts"][1]["text"]
+        contents[0]["parts"][1]["text"] = default_prompt + user_text
+
+        model_name = data.get("model", "gemini-1.5-flash")
+        model = genai.GenerativeModel(model_name=model_name)
+        response = model.generate_content(contents, stream=True)
+        return generate_stream(response), {'Content-Type': 'text/event-stream'}
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/automated", methods=["POST"])
+def automated_api():
+    """
+    Automated endpoint:
+    Always uses a fixed standard prompt and expects a base64 image.
+    """
+    try:
+        data = request.get_json()
+        image_base64 = data.get("image_base64")
+        if not image_base64:
+            raise Exception("No image provided.")
+
+        standard_prompt = (
+            "Observe the image and describe what you see. You need to say what are the major objects or people in the frame and any major action going on. "
+            "Explain which objects or actions are to the left or right. Describe only the objects, people, or actions in the frame in 35 words in a natural, simple style."
+        )
+        contents = [{
+           "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}},
+                {"text": standard_prompt}
+            ]
+        }]
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+        response = model.generate_content(contents, stream=True)
+        return generate_stream(response), {'Content-Type': 'text/event-stream'}
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/tts", methods=["POST"])
+def tts_api():
+    """
+    TTS endpoint:
+    Receives text and returns a URL to the generated MP3 using gTTS.
+    """
+    try:
+        data = request.get_json()
+        text = data.get("text")
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+
+        filename = f"{uuid.uuid4()}.mp3"
+        filepath = os.path.join(tts_output_dir, filename)
+        tts = gTTS(text, lang="en")
+        tts.save(filepath)
+        return jsonify({"url": f"/{tts_output_dir}/{filename}"})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/automated")
+def automated_page():
+    return send_file('web/automated.html')
+
+@app.route('/<path:path>')
+def serve_static(path):
+    return send_from_directory('web', path)
+
+# ----------------- New Capture Endpoint -----------------
+@app.route("/api/capture", methods=["GET"])
+def capture_image():
+    """
+    Endpoint to capture an image using the Pi camera command.
+    Runs the capture command synchronously so that the image is captured before responding.
+    Returns a JSON object containing the base64-encoded image.
+    """
+    try:
+        # Define the output path for the captured image.
+        output_path = os.path.expanduser("~/Desktop/capture.jpg")
+        # Build the command to capture the image.
+        cmd = ["libcamera-jpeg", "-o", output_path, "-t", "2000", "--width", "800", "--height", "600"]
+        # Run the capture command and wait for it to complete.
+        subprocess.run(cmd, check=True)
+
+        # Open the captured image, encode it to base64.
+        with open(output_path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+
+        return jsonify({"image_base64": encoded_string})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+# ----------------- End of Capture Endpoint -----------------
+
+# ----------------- Battery Status Endpoint -----------------
+@app.route("/battery-status")
+def battery_status():
+    """
+    Returns the battery percentage and remaining seconds as JSON.
+    The percentage is calculated based on a full battery (10800 seconds).
+    """
+    with state_lock:
+        current = remaining_seconds
+    percentage = int((current / BATTERY_FULL_SECONDS) * 100)
+    return jsonify({'percentage': percentage, 'remaining_seconds': int(current)})
+# ----------------- End of Battery Status Endpoint -----------------
+
+if __name__ == "__main__":
+    # Start the battery timer thread
+    threading.Thread(target=timer_thread, daemon=True).start()
+
+    # Run the Flask app with your desired parameters
+    app.run(
+        host='0.0.0.0',
+        port=5000,
+        debug=False,
+        use_reloader=False,
+        ssl_context=('cert.pem', 'key.pem')
+    )
+
+
+
+
+
